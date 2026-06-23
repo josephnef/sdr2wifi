@@ -40,7 +40,25 @@ Expect e.g. `decoded frames: 62` and `RESULT: PASS`.
 3. A `brew upgrade gnuradio` can orphan the OOT installs (they're in `/opt/homebrew`
    but not brew-tracked) — rebuild gr-foo + gr-ieee802-11 if blocks go missing.
 
-## Next rungs (need hardware)
-- **Rung 2:** single-B210 RF loopback — TX `TRXA` (ch0) → SMA cable + 60 dB pads →
-  RX `RXB` (ch1, ant `RX2`); one flowgraph, 5 MHz fits USB 2.0.
-- Then a real over-air 802.11p RX (5.9 GHz) once a USB-3 link is sorted.
+## Rung 2: single-B210 over-cable RF loopback (`rf_loopback.py`)
+
+Same PHY, but the internal channel is replaced by the real B210, full-duplex in one
+flowgraph: TX out **`TRXA`** (ch0, ant `TX/RX`) → SMA cable + **~60 dB attenuators** →
+RX in **`RXB`** (ch1, ant `RX2`). Defaults 5 MHz @ 5.890 GHz with `sc8` so the
+full-duplex stream fits USB-2.
+
+```sh
+ulimit -n 8192; export PYTHONPATH="$PWD" UHD_IMAGES_DIR=/opt/homebrew/share/uhd/images
+./rf_loopback.py --check                 # open + configure the B210, NO transmit (sanity)
+./rf_loopback.py --secs 5                # run the real loopback (needs the cable+pads)
+./rf_loopback.py --tx-gain 60 --rx-gain 30   # tune levels until frames decode
+```
+
+**Before running:** wire `TRXA → 60 dB pads → RXB` (never bare — protects the RX).
+If `--check` errors with *"No devices found"*, the B210 is in the macOS morph-stuck
+state → unplug/replug the USB once. If it opens but no frames decode: confirm
+*"Operating over USB 3"* (USB-2 full-duplex at 5 MHz is borderline — overruns/underruns
+mean the USB-2 ceiling), and tune `--tx-gain` up (too weak) or down (overload).
+
+## Next rung
+- Real over-air 802.11p RX (5.9 GHz, 10 MHz) once a USB-3 link is sorted.
