@@ -74,6 +74,17 @@ LONG40 = np.zeros(128, dtype=np.complex64)
 LONG40[6:59] = LONG[6:59]
 LONG40[70:123] = LONG[6:59] * np.complex64(1j)
 
+# HT40 HT-LTF: fills ALL 114 occupied bins (incl the center carriers + subchannel
+# centers the duplicate L-LTF leaves null) so the HT40 data channel can be
+# estimated. Lower subchannel real, upper rotated by j. Matches base.cc HTLTF40.
+HTLTF40 = LONG40.copy()
+HTLTF40[32] = 1
+HTLTF40[96] = 1j
+for _b in (59, 60, 61, 62):
+    HTLTF40[_b] = 1
+for _b in (66, 67, 68, 69):
+    HTLTF40[_b] = 1j
+
 
 # ---- bit-level coding (mirrors lib/utils.cc) ----------------------------------
 def parity(x):
@@ -361,9 +372,10 @@ def gen_ht40(psdu, mcs=0):
     htsig1 = sig_symbol_dup40(hsig_il[0:48], 3, rotate=True)
     htsig2 = sig_symbol_dup40(hsig_il[48:96], 4, rotate=True)
 
-    # HT-STF (sym5), HT-LTF (sym6): full-band 128 (RX skips both)
+    # HT-STF (sym5): full-band (RX skips). HT-LTF (sym6): true HT40 LTF covering
+    # all 114 occupied bins -> the RX estimates the HT40 data channel from it.
     htstf = ofdm_symbol(LONG40)
-    htltf = ofdm_symbol(LONG40)
+    htltf = ofdm_symbol(HTLTF40)
 
     # HT DATA: 108 SC, 128-FFT
     data_bits = np.zeros(nsym * n_dbps, dtype=np.uint8)
