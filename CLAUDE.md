@@ -57,6 +57,15 @@ export PYTHONPATH="$OOT:$PWD" LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib64:$LD_LIB
   replay-harness artifact. When a frame *is* detected it decodes correctly (0 CRC failures);
   judge by `fail=0`, not by detecting every rep.
 
+**The regression gate is `scripts/run-tests.sh`** (run by CI via the `Dockerfile`; deps pinned
+in `deps.env`, built by `scripts/build-deps.sh`). It hard-gates on the deterministic checks —
+the bit-exact MIMO `--selftest` (all MCS), legacy/HT20/HT40 replay (single sync chain,
+reliable), and the Rung-1 loopback — and treats the **2x2 MIMO end-to-end replay as
+informational** (WARN, not FAIL): two independent sync chains diverge on frame-start
+nondeterministically under noise at any SNR, corrupting whole frames, so MIMO *correctness* is
+gated by `--selftest`, not the flowgraph. Run it after any decode change:
+`./scripts/run-tests.sh` (add `--full` for every MCS).
+
 ## Where the decode lives (the fork)
 
 In `~/git/gr-ieee802-11` (branch `feat/ht-vht-rx`):

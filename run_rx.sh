@@ -24,5 +24,7 @@ OOT_PY="${OOT_PY%/ieee802_11}"
 
 ulimit -n 8192                                   # GNU Radio vmcircbuf wants a high fd limit
 export PYTHONPATH="$OOT_PY:$(pwd)"               # OOT modules + repo (wifi_phy_hier)
-export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib64:$LD_LIBRARY_PATH"
+GR_LIBS="$PREFIX/lib:$PREFIX/lib64"              # + Debian/Ubuntu multiarch libdir
+for d in "$PREFIX"/lib/*-linux-gnu; do [ -d "$d" ] && GR_LIBS="$d:$GR_LIBS"; done
+export LD_LIBRARY_PATH="$GR_LIBS:${LD_LIBRARY_PATH:-}"
 exec python3 wifi_rx_sniff.py "$@"

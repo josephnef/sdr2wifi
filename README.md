@@ -1,5 +1,7 @@
 # sdr2wifi
 
+[![ci](https://github.com/josephnef/sdr2wifi/actions/workflows/ci.yml/badge.svg)](https://github.com/josephnef/sdr2wifi/actions/workflows/ci.yml)
+
 A GNU Radio 802.11 receiver bring-up and a **synthetic validation harness** for a forked
 [`gr-ieee802-11`](https://github.com/josephnef/gr-ieee802-11) (branch `feat/ht-vht-rx`) that
 decodes **modern OFDM**: 802.11a/g/p legacy, 802.11n **HT** at 20 and 40 MHz, and **2×2
@@ -46,21 +48,28 @@ PHY-in, so a failure localizes to the layer you just added:
 
 - **GNU Radio 3.10.x** and **Python 3.14**.
 - OOT modules **`gr-foo`** and the **`gr-ieee802-11` fork** (branch `feat/ht-vht-rx`), built
-  against the same GNU Radio and installed into a prefix:
-  - **Linux:** a local prefix, default `~/grwifi-install` (override with `GRWIFI_PREFIX`).
-  - **macOS (Homebrew):** `/opt/homebrew`.
+  against the same GNU Radio. Their exact pinned commits live in [`deps.env`](deps.env)
+  (`gr-foo` is vanilla upstream; the modern-OFDM decode is in the fork).
 
-Build both OOT modules with the same recipe, just changing `PREFIX`:
+## Reproduce
+
+**Containerized (hermetic, no host setup beyond Docker)** — this is exactly what CI runs:
 
 ```sh
-# PREFIX=$HOME/grwifi-install   (Linux)   |   PREFIX=/opt/homebrew   (macOS Homebrew)
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-      -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j && cmake --install build
+docker build -t sdr2wifi . && docker run --rm sdr2wifi   # builds deps, runs the test matrix
 ```
 
-The wrapper scripts (`run.sh`, `run_rx.sh`) discover the OOT site-packages under `$PREFIX`
-automatically and set `PYTHONPATH` / `LD_LIBRARY_PATH` / `ulimit` for you.
+**Native** — build the pinned OOT deps into a prefix, then run the tests:
+
+```sh
+GRWIFI_PREFIX=~/grwifi-install ./scripts/build-deps.sh   # clone+build gr-foo + the fork
+./scripts/run-tests.sh                                    # asserting synthetic test matrix
+```
+
+`build-deps.sh` installs into `$GRWIFI_PREFIX` (default `~/grwifi-install`; use `/opt/homebrew`
+on macOS Homebrew). The wrapper scripts (`run.sh`, `run_rx.sh`, `run-tests.sh`) discover the
+OOT site-packages under that prefix and set `PYTHONPATH` / `LD_LIBRARY_PATH` / `ulimit` for
+you.
 
 ## Synthetic validation (no hardware)
 
@@ -167,3 +176,7 @@ Pair with any real 802.11 transmitter on the same channel.
 | `tools_record_iq.py` | Raw-IQ recorder from an SDR for offline replay. |
 | `wifi_phy_hier.py` | The PHY hier block — **grcc-generated, do not hand-edit**. |
 | `wifi_phy_hier.block.yml` | GRC block descriptor for `wifi_phy_hier` (GRC use only). |
+| `deps.env` | Pinned dependency commits (gr-foo, the gr-ieee802-11 fork). |
+| `scripts/build-deps.sh` | Clone + build the pinned OOT deps into a prefix. |
+| `scripts/run-tests.sh` | Asserting synthetic test matrix (the CI gate). |
+| `Dockerfile` | Hermetic build + test environment (also the CI image). |
