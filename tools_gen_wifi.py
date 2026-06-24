@@ -133,10 +133,76 @@ def map_bpsk(bits):
     return np.where(np.asarray(bits) > 0, 1.0, -1.0).astype(np.complex64)
 
 
-def data_symbol(coded_bits_for_sym, data_sc, sym_idx, rotate=False):
-    """One OFDM data/SIG symbol from n_data_sc BPSK bits + pilots."""
+# Constellation point tables (value -> point), matching lib/constellations_impl.cc.
+def _qpsk_pts():
+    l = np.sqrt(0.5)
+    return [(-l, -l), (l, -l), (-l, l), (l, l)]
+
+
+def _qam16_pts():
+    l = np.sqrt(0.1)
+    re = {0: -3, 1: 3, 2: -1, 3: 1}  # bits b0(sign),b1(inner) -> level
+    im = {0: -3, 1: 3, 2: -1, 3: 1}
+    pts = [None] * 16
+    for v in range(16):
+        r = re[(v & 1) | ((v >> 1 & 1) << 1)]
+        i = im[((v >> 2) & 1) | ((v >> 3 & 1) << 1)]
+        pts[v] = (r * l, i * l)
+    return pts
+
+
+def _qam64_pts():
+    l = np.sqrt(1 / 42.0)
+    lvl = {0: -7, 1: 7, 2: -1, 3: 1, 4: -5, 5: 5, 6: -3, 7: 3}  # 3-bit -> level
+    pts = [None] * 64
+    for v in range(64):
+        r = lvl[(v & 1) | ((v >> 1 & 1) << 1) | ((v >> 2 & 1) << 2)]
+        i = lvl[((v >> 3) & 1) | ((v >> 4 & 1) << 1) | ((v >> 5 & 1) << 2)]
+        pts[v] = (r * l, i * l)
+    return pts
+
+
+_CONST = {1: [(-1, 0), (1, 0)], 2: _qpsk_pts(), 4: _qam16_pts(), 6: _qam64_pts()}
+
+
+def map_qam(coded_bits, n_bpsc):
+    """Group n_bpsc bits (LSB-first) -> constellation point, matching the RX."""
+    pts = _CONST[n_bpsc]
+    n = len(coded_bits) // n_bpsc
+    out = np.empty(n, dtype=np.complex64)
+    for c in range(n):
+        v = 0
+        for k in range(n_bpsc):
+            v |= int(coded_bits[c * n_bpsc + k]) << k
+        r, i = pts[v]
+        out[c] = np.complex64(complex(r, i))
+    return out
+
+
+def puncture(coded, num, den):
+    """Mirror lib/utils.cc puncturing(): rates 1/2, 2/3, 3/4, 5/6."""
+    if (num, den) == (1, 2):
+        return coded
+    out = []
+    for i, b in enumerate(coded):
+        if (num, den) == (2, 3):
+            if i % 4 != 3:
+                out.append(b)
+        elif (num, den) == (3, 4):
+            if i % 6 not in (3, 4):
+                out.append(b)
+        elif (num, den) == (5, 6):
+            if i % 10 not in (3, 4, 7, 8):
+                out.append(b)
+        else:
+            out.append(b)
+    return np.array(out, dtype=np.uint8)
+
+
+def data_symbol(pts, data_sc, sym_idx, rotate=False):
+    """One OFDM data/SIG symbol from pre-mapped constellation points + pilots."""
     freq = np.zeros(64, dtype=np.complex64)
-    pts = map_bpsk(coded_bits_for_sym)
+    pts = np.asarray(pts, dtype=np.complex64)
     if rotate:
         pts = pts * np.complex64(1j)  # QBPSK (HT-SIG)
     for c, sc in enumerate(data_sc):
@@ -177,31 +243,39 @@ def gen_legacy(psdu, mcs_rate4=11):  # SIGNAL RATE field read as r=11 -> BPSK_1/
     scr[tail_pos:tail_pos + 6] = 0
     coded = conv_encode(scr)              # rate 1/2 -> nsym*48
     il = interleave(coded, n_cbps, n_bpsc)
-    sig = data_symbol(conv_then_il_sig(build_sig_bits(mcs_rate4, length)), DATA_SC_LEGACY, 2)
+    sig = data_symbol(map_bpsk(sig_field(mcs_rate4, length)), DATA_SC_LEGACY, 2)
     syms = [sig]
     for j in range(nsym):
-        syms.append(data_symbol(il[j * n_cbps:(j + 1) * n_cbps], DATA_SC_LEGACY, 3 + j))
+        syms.append(data_symbol(map_bpsk(il[j * n_cbps:(j + 1) * n_cbps]), DATA_SC_LEGACY, 3 + j))
     return np.concatenate([preamble()] + syms).astype(np.complex64)
 
 
-def conv_then_il_sig(sig_bits24):
-    coded = conv_encode(sig_bits24)        # 48
+def sig_field(rate4, length12):
+    """48 interleaved BPSK bits for the (L-)SIG OFDM symbol."""
+    coded = conv_encode(build_sig_bits(rate4, length12))   # 48
     return interleave(coded, 48, 1)
 
 
+# HT MCS (per stream, 20 MHz): n_bpsc, rate num/den, n_cbps, n_dbps
+HT_MCS = {
+    0: (1, 1, 2, 52, 26), 1: (2, 1, 2, 104, 52), 2: (2, 3, 4, 104, 78),
+    3: (4, 1, 2, 208, 104), 4: (4, 3, 4, 208, 156), 5: (6, 2, 3, 312, 208),
+    6: (6, 3, 4, 312, 234), 7: (6, 5, 6, 312, 260),
+}
+
+
 def gen_ht(psdu, mcs=0):
-    # HT MCS0 = BPSK 1/2, 52 data SC
-    n_bpsc, n_cbps, n_dbps = 1, 52, 26
+    n_bpsc, rnum, rden, n_cbps, n_dbps = HT_MCS[mcs]
     length = len(psdu)
-    # L-SIG: rate=6M(0x0D), length picked so legacy duration covers HT frame
     nsym = int(np.ceil((16 + 8 * length + 6) / n_dbps))
+    # L-SIG: always 6 Mbps (r=11); length large enough to cover the HT frame
     lsig_len = max(length + 16, 40)
-    sig = data_symbol(conv_then_il_sig(build_sig_bits(11, lsig_len)), DATA_SC_LEGACY, 2)
+    sig = data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 2)
 
     # HT-SIG: 48 info bits = HT-SIG1(24) + HT-SIG2(24); QBPSK over 2 symbols
     hsig = np.zeros(48, dtype=np.uint8)
     for i in range(7):
-        hsig[i] = (mcs >> i) & 1          # MCS (0..6)
+        hsig[i] = (mcs >> i) & 1          # MCS
     hsig[7] = 0                            # CBW20
     for i in range(16):
         hsig[8 + i] = (length >> i) & 1    # HT-Length
@@ -209,10 +283,9 @@ def gen_ht(psdu, mcs=0):
     crc = ht_sig_crc8(hsig[0:34])
     for i in range(8):
         hsig[34 + i] = (crc >> (7 - i)) & 1   # MSB-first c7..c0
-    hsig_coded = conv_encode(hsig)         # 96
-    hsig_il = interleave(hsig_coded, 48, 1)
-    htsig1 = data_symbol(hsig_il[0:48], DATA_SC_LEGACY, 3, rotate=True)
-    htsig2 = data_symbol(hsig_il[48:96], DATA_SC_LEGACY, 4, rotate=True)
+    hsig_il = interleave(conv_encode(hsig), 48, 1)  # 96, legacy 48-interleaver
+    htsig1 = data_symbol(map_bpsk(hsig_il[0:48]), DATA_SC_LEGACY, 3, rotate=True)
+    htsig2 = data_symbol(map_bpsk(hsig_il[48:96]), DATA_SC_LEGACY, 4, rotate=True)
 
     # HT-STF (sym5), HT-LTF (sym6) -- RX skips both. Use FULL-BAND symbols (not
     # the periodic short-training pattern) so sync_short does not re-trigger
@@ -220,15 +293,15 @@ def gen_ht(psdu, mcs=0):
     htstf = ofdm_symbol(LONG)
     htltf = ofdm_symbol(LONG)
 
-    # HT DATA
+    # HT DATA: scramble -> conv 1/2 -> puncture(rate) -> HT-interleave -> QAM map
     data_bits = np.zeros(nsym * n_dbps, dtype=np.uint8)
     data_bits[16:16 + 8 * length] = bytes_to_bits(psdu)
     scr = scramble(data_bits)
     scr[16 + 8 * length:16 + 8 * length + 6] = 0   # tail
-    coded = conv_encode(scr)               # nsym*52
+    coded = puncture(conv_encode(scr), rnum, rden)  # -> nsym*n_cbps
     il = interleave_ht(coded, n_cbps, n_bpsc)
-    data_syms = [data_symbol(il[j * n_cbps:(j + 1) * n_cbps], DATA_SC_HT, 7 + j)
-                 for j in range(nsym)]
+    data_syms = [data_symbol(map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc),
+                             DATA_SC_HT, 7 + j) for j in range(nsym)]
     return np.concatenate([preamble(), sig, htsig1, htsig2, htstf, htltf]
                           + data_syms).astype(np.complex64)
 
