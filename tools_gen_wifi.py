@@ -432,6 +432,237 @@ def gen_ht(psdu, mcs=0):
                           + data_syms).astype(np.complex64)
 
 
+# ---- 802.11n HT 2x2 MIMO (MCS 8-15, 20 MHz) ----------------------------------
+# MCS 8..15 are MCS 0..7 carried on 2 spatial streams (same per-stream modulation).
+HT_MCS_MIMO = {8 + k: HT_MCS[k] for k in range(8)}  # mcs -> per-stream params
+
+# HT20 HT-LTF: L-LTF extended to the HT edge tones (sc +-27,+-28 = bins 4,5,59,60),
+# so the 2x2 channel can be estimated on every HT20 data/pilot subcarrier (4..60).
+HTLTF20 = LONG.copy()
+HTLTF20[4] = 1; HTLTF20[5] = 1; HTLTF20[59] = -1; HTLTF20[60] = -1
+
+# HT-LTF mapping matrix P (802.11-2016 Table 19-17), 2x2 case.
+P2 = np.array([[1, -1], [1, 1]], dtype=np.complex64)
+N_ROT_20 = 11  # HT20 interleaver frequency-rotation unit
+
+
+def stream_parse(coded, n_ss, n_bpsc, n_cbps_ss):
+    """802.11n stream parser (19.3.11.6): single BCC stream -> n_ss streams, s bits
+    at a time round-robin. Returns a list of n_ss bit arrays of n_cbps_ss*nsym each."""
+    s = max(n_bpsc // 2, 1)
+    nsym = len(coded) // (n_ss * n_cbps_ss)
+    out = [np.zeros(nsym * n_cbps_ss, dtype=np.uint8) for _ in range(n_ss)]
+    # per OFDM symbol, deal s-bit blocks across streams
+    pos = [0] * n_ss
+    idx = 0
+    blocks_per_sym = (n_ss * n_cbps_ss) // s
+    for sym in range(nsym):
+        for blk in range(blocks_per_sym):
+            ss = blk % n_ss
+            for b in range(s):
+                out[ss][pos[ss]] = coded[idx]; pos[ss] += 1; idx += 1
+    return out
+
+
+def interleave_ht_ss(bits, n_cbps_ss, n_bpsc, iss, bw=20):
+    """HT interleave for spatial stream iss (0-based), with the 3rd permutation
+    frequency rotation (19.3.11.7.3) applied for iss>0. Forward map k -> position."""
+    s = max(n_bpsc // 2, 1)
+    n_col = 18 if bw == 40 else 13
+    n_row = (6 if bw == 40 else 4) * n_bpsc
+    n_rot = 29 if bw == 40 else N_ROT_20
+    # third-permutation shift in bits for this stream (i_SS is 1-based in the spec)
+    issp = iss + 1
+    jrot = (((issp - 1) * 2) % 3 + 3 * ((issp - 1) // 3)) * n_rot * n_bpsc
+    out = np.empty_like(bits)
+    nsym = len(bits) // n_cbps_ss
+    for sym in range(nsym):
+        base = sym * n_cbps_ss
+        for k in range(n_cbps_ss):
+            i = n_row * (k % n_col) + (k // n_col)
+            j = s * (i // s) + (i + n_cbps_ss - (n_col * i) // n_cbps_ss) % s
+            r = (j - jrot) % n_cbps_ss
+            out[base + r] = bits[base + k]
+    return out
+
+
+def ht_mimo_streams(psdu, mcs):
+    """Build the 2 spatial-stream frequency-domain data symbols for MCS 8-15 (HT20).
+    Returns (stream_syms, nsym, coded) where stream_syms[ss][j] is a 52-point vector."""
+    n_bpsc, rnum, rden, n_cbps_ss, n_dbps_ss = HT_MCS_MIMO[mcs]
+    n_ss = 2
+    length = len(psdu)
+    n_dbps_tot = n_ss * n_dbps_ss
+    nsym = int(np.ceil((16 + 8 * length + 6) / n_dbps_tot))
+
+    data_bits = np.zeros(nsym * n_dbps_tot, dtype=np.uint8)
+    data_bits[16:16 + 8 * length] = bytes_to_bits(psdu)
+    scr = scramble(data_bits)
+    scr[16 + 8 * length:16 + 8 * length + 6] = 0
+    coded = puncture(conv_encode(scr), rnum, rden)            # nsym*n_ss*n_cbps_ss
+
+    parts = stream_parse(coded, n_ss, n_bpsc, n_cbps_ss)
+    stream_syms = []
+    for ss in range(n_ss):
+        il = interleave_ht_ss(parts[ss], n_cbps_ss, n_bpsc, ss, bw=20)
+        syms = [map_qam(il[j * n_cbps_ss:(j + 1) * n_cbps_ss], n_bpsc) for j in range(nsym)]
+        stream_syms.append(syms)
+    return stream_syms, nsym, coded
+
+
+def gen_ht_mimo(psdu, mcs=8, H=None):
+    """2x2 HT-MIMO (MCS 8-15, 20 MHz) -> (rx0, rx1) time-domain captures.
+    Legacy preamble/L-SIG/HT-SIG/HT-STF on TX antenna 0; HT-LTF over 2 symbols via
+    the P matrix; HT-DATA = 2 spatial streams through a frequency-flat 2x2 channel H
+    (rx_r[n] = sum_s H[r,s] tx_s[n])."""
+    if H is None:
+        H = np.eye(2, dtype=np.complex64)
+    n_bpsc, rnum, rden, n_cbps_ss, n_dbps_ss = HT_MCS_MIMO[mcs]
+    length = len(psdu)
+    lsig_len = max(length + 16, 40)
+
+    # --- TX antenna 0: the (single-stream) preamble + signalling ---
+    sig = data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 2)
+    hsig = np.zeros(48, dtype=np.uint8)
+    for i in range(7):
+        hsig[i] = (mcs >> i) & 1
+    hsig[7] = 0                                   # CBW20
+    for i in range(16):
+        hsig[8 + i] = (length >> i) & 1
+    crc = ht_sig_crc8(hsig[0:34])
+    for i in range(8):
+        hsig[34 + i] = (crc >> (7 - i)) & 1
+    hsig_il = interleave(conv_encode(hsig), 48, 1)
+    htsig1 = data_symbol(map_bpsk(hsig_il[0:48]), DATA_SC_LEGACY, 3, rotate=True)
+    htsig2 = data_symbol(map_bpsk(hsig_il[48:96]), DATA_SC_LEGACY, 4, rotate=True)
+    htstf = ofdm_symbol(LONG)
+
+    tx0_pre = np.concatenate([preamble(), sig, htsig1, htsig2, htstf]).astype(np.complex64)
+    tx1_pre = np.zeros_like(tx0_pre)              # antenna 1 silent during preamble
+
+    # --- HT-LTF: 2 symbols, P-matrix across the 2 TX antennas ---
+    def ltf_freq(antenna, ltf_sym):
+        f = np.zeros(64, dtype=np.complex64)
+        for sc in range(4, 61):
+            f[sc] = HTLTF20[sc] * P2[ltf_sym, antenna]
+        return f
+    tx0_ltf = np.concatenate([ofdm_symbol(ltf_freq(0, 0)), ofdm_symbol(ltf_freq(0, 1))])
+    tx1_ltf = np.concatenate([ofdm_symbol(ltf_freq(1, 0)), ofdm_symbol(ltf_freq(1, 1))])
+
+    # --- HT-DATA: 2 spatial streams, direct spatial mapping (stream s -> antenna s) ---
+    stream_syms, nsym, coded = ht_mimo_streams(psdu, mcs)
+    tx0_data, tx1_data = [], []
+    for j in range(nsym):
+        f0 = np.zeros(64, dtype=np.complex64)
+        f1 = np.zeros(64, dtype=np.complex64)
+        for c, sc in enumerate(DATA_SC_HT):
+            f0[sc] = stream_syms[0][j][c]
+            f1[sc] = stream_syms[1][j][c]
+        p = POLARITY[(7 + j - 2) % 127]
+        # HT20 pilots: stream 0 on the 4 pilot tones (stream 1 uses the P-rotated set;
+        # for a 2-stream direct-mapped synthetic test we drive pilots from stream 0).
+        for pv, sc in zip(PILOT_VAL, PILOT_SC):
+            f0[sc] = pv * p
+        tx0_data.append(ofdm_symbol(f0))
+        tx1_data.append(ofdm_symbol(f1))
+
+    tx0 = np.concatenate([tx0_pre, tx0_ltf] + tx0_data).astype(np.complex64)
+    tx1 = np.concatenate([tx1_pre, tx1_ltf] + tx1_data).astype(np.complex64)
+
+    # frequency-flat 2x2 channel mixing in the time domain
+    rx0 = (H[0, 0] * tx0 + H[0, 1] * tx1).astype(np.complex64)
+    rx1 = (H[1, 0] * tx0 + H[1, 1] * tx1).astype(np.complex64)
+    return rx0, rx1, coded
+
+
+def demap_qam(sym, n_bpsc):
+    """Hard-decision inverse of map_qam: nearest constellation point -> bits LSB-first."""
+    pts = _CONST[n_bpsc]
+    best, bestd = 0, 1e30
+    for v, (r, i) in enumerate(pts):
+        d = (sym.real - r) ** 2 + (sym.imag - i) ** 2
+        if d < bestd:
+            bestd, best = d, v
+    return [(best >> k) & 1 for k in range(n_bpsc)]
+
+
+def mimo_selftest(mcs=8, H=None):
+    """Bit-exact reference receiver: recover the HT-MIMO *coded bits* from (rx0,rx1)
+    via HT-LTF channel estimate + per-subcarrier ZF/MMSE + demap + deinterleave +
+    stream-deparse, and check they equal the transmitted coded bits. Proves the 2x2
+    data model is invertible (the C++ RX must reproduce this)."""
+    if H is None:
+        H = np.array([[1.0, 0.3 + 0.2j], [-0.2 + 0.1j, 0.9]], dtype=np.complex64)
+    n_bpsc, rnum, rden, n_cbps_ss, n_dbps_ss = HT_MCS_MIMO[mcs]
+    psdu = make_psdu()
+    rx0, rx1, coded_tx = gen_ht_mimo(psdu, mcs, H)
+    nsym = (len(rx0) - 800) // 80
+
+    def sym_fft(rx, start):
+        t = rx[start + 16:start + 80]               # strip 16-sample CP
+        return np.fft.fftshift(np.fft.fft(t))
+
+    # HT-LTF channel estimate: 2 LTF symbols at samples 640 / 720
+    Pinv = np.linalg.inv(P2.astype(np.complex128))
+    Hh = np.zeros((64, 2, 2), dtype=np.complex128)   # [sc][rx][stream]
+    y_ltf = [[sym_fft(rx0, 640), sym_fft(rx0, 720)],
+             [sym_fft(rx1, 640), sym_fft(rx1, 720)]]
+    for sc in range(4, 61):
+        if HTLTF20[sc] == 0:
+            continue
+        for r in range(2):
+            yv = np.array([y_ltf[r][0][sc], y_ltf[r][1][sc]])
+            Hh[sc, r, :] = (Pinv @ yv) / HTLTF20[sc]
+
+    # data: per-subcarrier MMSE (noiseless -> ZF) recovers the 2 streams
+    rec_streams = [np.zeros(nsym * n_cbps_ss, dtype=np.uint8) for _ in range(2)]
+    for j in range(nsym):
+        Y0 = sym_fft(rx0, 800 + j * 80); Y1 = sym_fft(rx1, 800 + j * 80)
+        cbits = [[], []]
+        for sc in DATA_SC_HT:
+            Hk = Hh[sc]
+            y = np.array([Y0[sc], Y1[sc]])
+            xhat = np.linalg.solve(Hk, y)            # ZF (noiseless)
+            for ss in range(2):
+                cbits[ss].extend(demap_qam(xhat[ss], n_bpsc))
+        for ss in range(2):
+            rec_streams[ss][j * n_cbps_ss:(j + 1) * n_cbps_ss] = cbits[ss]
+
+    # deinterleave each stream, then de-parse back to the single coded sequence
+    deint = []
+    for ss in range(2):
+        fwd = np.empty(n_cbps_ss, dtype=int)
+        s = max(n_bpsc // 2, 1); n_col = 13; n_row = 4 * n_bpsc
+        issp = ss + 1
+        jrot = (((issp - 1) * 2) % 3 + 3 * ((issp - 1) // 3)) * N_ROT_20 * n_bpsc
+        for k in range(n_cbps_ss):
+            i = n_row * (k % n_col) + (k // n_col)
+            jj = s * (i // s) + (i + n_cbps_ss - (n_col * i) // n_cbps_ss) % s
+            fwd[k] = (jj - jrot) % n_cbps_ss          # forward k -> position
+        d = np.zeros_like(rec_streams[ss])
+        for sym in range(nsym):
+            base = sym * n_cbps_ss
+            for k in range(n_cbps_ss):
+                d[base + k] = rec_streams[ss][base + fwd[k]]
+        deint.append(d)
+    # de-parse (inverse stream_parse): s bits at a time, round-robin from the streams
+    s = max(n_bpsc // 2, 1)
+    rec_coded = np.zeros(2 * len(deint[0]), dtype=np.uint8)
+    pos = [0, 0]; idx = 0
+    blocks_per_sym = (2 * n_cbps_ss) // s
+    for sym in range(nsym):
+        for blk in range(blocks_per_sym):
+            ss = blk % 2
+            for b in range(s):
+                rec_coded[idx] = deint[ss][pos[ss]]; pos[ss] += 1; idx += 1
+
+    ok = np.array_equal(rec_coded[:len(coded_tx)], coded_tx)
+    nerr = int(np.sum(rec_coded[:len(coded_tx)] != coded_tx))
+    print(f"[mimo-selftest] mcs={mcs} nsym={nsym} coded_bits={len(coded_tx)} "
+          f"bit_errors={nerr} -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def make_psdu(payload_len=24):
     # minimal 802.11 data-ish MPDU + correct CRC-32 FCS (zlib == RX residue)
     mpdu = bytes([0x08, 0x01, 0x00, 0x00] + [0xff] * 6 +
@@ -444,13 +675,19 @@ def make_psdu(payload_len=24):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["legacy", "ht", "ht40"], default="ht")
+    p.add_argument("--mode", choices=["legacy", "ht", "ht40", "ht_mimo"], default="ht")
     p.add_argument("--mcs", type=int, default=0)
     p.add_argument("--out", default="/tmp/wifi.cf32")
     p.add_argument("--reps", type=int, default=20, help="repeat the frame N times")
     p.add_argument("--gap", type=int, default=400, help="zero samples between frames")
     p.add_argument("--snr", type=float, default=30.0, help="AWGN SNR (dB)")
+    p.add_argument("--selftest", action="store_true",
+                   help="ht_mimo: run the bit-exact reference-RX data-model self-test")
     a = p.parse_args()
+
+    if a.mode == "ht_mimo" and a.selftest:
+        mcs = a.mcs if a.mcs >= 8 else 8
+        sys.exit(0 if mimo_selftest(mcs) else 1)
 
     psdu = make_psdu()
     if a.mode == "legacy":
