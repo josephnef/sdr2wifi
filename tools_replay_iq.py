@@ -9,7 +9,7 @@ intermittent frame-triggered crash under AddressSanitizer:
 Exit 0 if it ran to completion, non-zero count printed. A crash (segfault /
 ASan abort) reproduces the bug on the exact captured samples.
 """
-import sys, argparse
+import sys, time, argparse
 from gnuradio import gr, blocks
 import ieee802_11
 from wifi_phy_hier import wifi_phy_hier
@@ -34,10 +34,18 @@ def main():
     p.add_argument("--in", dest="infile", default="/tmp/cap.cf32")
     p.add_argument("--bw", type=float, default=20e6)
     p.add_argument("--freq", type=float, default=5180e6)
+    p.add_argument("--secs", type=float, default=20.0,
+                   help="wall-clock budget; file_source runs as fast as the CPU "
+                        "allows, so this just needs to exceed the processing time")
     a = p.parse_args()
     tb = replay(a)
-    tb.run()
-    print(f"[replay] decoded frames: {tb.dbg.num_messages()}")
+    # file_source(repeat=False) hits EOF, but the hier block's message topology
+    # can keep run() from returning -- drive it with start/sleep/stop instead.
+    tb.start()
+    time.sleep(a.secs)
+    tb.stop()
+    tb.wait()
+    print(f"[replay] decoded (legacy) frames: {tb.dbg.num_messages()}")
 
 
 if __name__ == "__main__":
