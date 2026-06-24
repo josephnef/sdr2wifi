@@ -445,6 +445,10 @@ HTLTF20[4] = 1; HTLTF20[5] = 1; HTLTF20[59] = -1; HTLTF20[60] = -1
 P2 = np.array([[1, -1], [1, 1]], dtype=np.complex64)
 N_ROT_20 = 11  # HT20 interleaver frequency-rotation unit
 
+# Default synthetic 2x2 channel. Off-diagonal terms are non-zero so BOTH RX antennas
+# receive the (TX-antenna-0) legacy preamble -> both sync chains lock and co-index.
+H_MIMO_DEFAULT = np.array([[1.0, 0.3 + 0.2j], [-0.2 + 0.1j, 0.9]], dtype=np.complex64)
+
 
 def stream_parse(coded, n_ss, n_bpsc, n_cbps_ss):
     """802.11n stream parser (19.3.11.6): single BCC stream -> n_ss streams, s bits
@@ -516,7 +520,7 @@ def gen_ht_mimo(psdu, mcs=8, H=None):
     the P matrix; HT-DATA = 2 spatial streams through a frequency-flat 2x2 channel H
     (rx_r[n] = sum_s H[r,s] tx_s[n])."""
     if H is None:
-        H = np.eye(2, dtype=np.complex64)
+        H = H_MIMO_DEFAULT
     n_bpsc, rnum, rden, n_cbps_ss, n_dbps_ss = HT_MCS_MIMO[mcs]
     length = len(psdu)
     lsig_len = max(length + 16, 40)
@@ -592,7 +596,7 @@ def mimo_selftest(mcs=8, H=None):
     stream-deparse, and check they equal the transmitted coded bits. Proves the 2x2
     data model is invertible (the C++ RX must reproduce this)."""
     if H is None:
-        H = np.array([[1.0, 0.3 + 0.2j], [-0.2 + 0.1j, 0.9]], dtype=np.complex64)
+        H = H_MIMO_DEFAULT
     n_bpsc, rnum, rden, n_cbps_ss, n_dbps_ss = HT_MCS_MIMO[mcs]
     psdu = make_psdu()
     rx0, rx1, coded_tx = gen_ht_mimo(psdu, mcs, H)
@@ -690,24 +694,36 @@ def main():
         sys.exit(0 if mimo_selftest(mcs) else 1)
 
     psdu = make_psdu()
+
+    def tile_noise(frame, scale):
+        gap = np.zeros(a.gap, dtype=np.complex64)
+        sig = np.tile(np.concatenate([gap, frame * scale]), a.reps).astype(np.complex64)
+        p_sig = np.mean(np.abs(frame * scale) ** 2)
+        n0 = p_sig / (10 ** (a.snr / 10))
+        noise = (np.random.normal(0, np.sqrt(n0 / 2), len(sig)) +
+                 1j * np.random.normal(0, np.sqrt(n0 / 2), len(sig))).astype(np.complex64)
+        return (sig + noise).astype(np.complex64)
+
+    if a.mode == "ht_mimo":
+        mcs = a.mcs if a.mcs >= 8 else 8
+        rx0, rx1, _ = gen_ht_mimo(psdu, mcs)
+        # one shared scale keeps the relative 2x2 channel amplitudes intact
+        scale = 0.5 / max(np.max(np.abs(rx0)), np.max(np.abs(rx1)))
+        out1 = a.out.replace(".cf32", "") + "_ant1.cf32"
+        tile_noise(rx0, scale).tofile(a.out)
+        tile_noise(rx1, scale).tofile(out1)
+        print(f"[gen] mode=ht_mimo mcs={mcs} (2x2) psdu={len(psdu)}B frame={len(rx0)} samp "
+              f"x{a.reps} -> {a.out} + {out1}")
+        return
+
     if a.mode == "legacy":
         frame = gen_legacy(psdu)
     elif a.mode == "ht40":
         frame = gen_ht40(psdu, a.mcs)
     else:
         frame = gen_ht(psdu, a.mcs)
-    frame = frame / np.max(np.abs(frame)) * 0.5
 
-    gap = np.zeros(a.gap, dtype=np.complex64)
-    one = np.concatenate([gap, frame])
-    sig = np.tile(one, a.reps).astype(np.complex64)
-    # AWGN
-    p_sig = np.mean(np.abs(frame) ** 2)
-    n0 = p_sig / (10 ** (a.snr / 10))
-    noise = (np.random.normal(0, np.sqrt(n0 / 2), len(sig)) +
-             1j * np.random.normal(0, np.sqrt(n0 / 2), len(sig))).astype(np.complex64)
-    sig = (sig + noise).astype(np.complex64)
-
+    sig = tile_noise(frame, 0.5 / np.max(np.abs(frame)))
     sig.tofile(a.out)
     print(f"[gen] mode={a.mode} mcs={a.mcs} psdu={len(psdu)}B frame={len(frame)} samp "
           f"x{a.reps} -> {a.out} ({sig.nbytes} bytes)")
