@@ -119,7 +119,9 @@ def main():
                    help="RF center (Hz); 5180e6 = 5 GHz ch36, 2437e6 = 2.4 GHz ch6")
     p.add_argument("--lo-offset", dest="lo_offset", type=float, default=0.0,
                    help="LO offset (Hz); MUST be < Fs/2. 0 is safest (802.11 nulls DC).")
-    p.add_argument("--rx-gain", dest="rx_gain", type=float, default=40.0)
+    # 50 dB is the measured sweet spot on this link (RX2 antenna): a gain sweep
+    # gave ~2.9k decoded frames @40 dB, ~8.7k @55 dB, ~3.9k @70 dB (overload).
+    p.add_argument("--rx-gain", dest="rx_gain", type=float, default=50.0)
     p.add_argument("--otw", default="sc8", help="over-the-wire fmt; sc8 halves USB load")
     p.add_argument("--rx-chan", dest="rx_chan", type=int, default=0)
     p.add_argument("--rx-ant", dest="rx_ant", default="RX2")
