@@ -231,13 +231,19 @@ def puncture(coded, num, den):
     return np.array(out, dtype=np.uint8)
 
 
-def data_symbol(pts, data_sc, sym_idx, rotate=False, pilot_rotate=None):
+def data_symbol(pts, data_sc, sym_idx, rotate=False, pilot_rotate=None, pilot_cycle=None):
     """One OFDM data/SIG symbol from pre-mapped constellation points + pilots.
 
     `rotate` rotates the DATA carriers by j (QBPSK). `pilot_rotate` controls the
     pilots independently; it defaults to `rotate`. Spec HT-SIG / VHT-SIG-A QBPSK
     symbols carry QBPSK DATA but BPSK PILOTS, so the RX derotation lands the data
-    on the imaginary axis -- pass rotate=True, pilot_rotate=False for those."""
+    on the imaginary axis -- pass rotate=True, pilot_rotate=False for those.
+
+    `pilot_cycle` (the 0-based data-symbol index) selects the 802.11 cycling DATA
+    pilots used by real silicon and the chip-validated TX: the base pilot pattern
+    is cyclically rotated by that index and scaled by POLARITY[sym_idx-4] (data
+    starts at sym 7 HT / 8 VHT, polarity start index 3). SIG symbols leave it None
+    and keep the fixed pattern x POLARITY[sym_idx-2]."""
     if pilot_rotate is None:
         pilot_rotate = rotate
     freq = np.zeros(64, dtype=np.complex64)
@@ -246,9 +252,16 @@ def data_symbol(pts, data_sc, sym_idx, rotate=False, pilot_rotate=None):
         pts = pts * np.complex64(1j)  # QBPSK data
     for c, sc in enumerate(data_sc):
         freq[sc] = pts[c]
-    p = POLARITY[(sym_idx - 2) % 127]
-    for pv, sc in zip(PILOT_VAL, PILOT_SC):
-        freq[sc] = pv * p * (np.complex64(1j) if pilot_rotate else np.complex64(1))
+    rot = np.complex64(1j) if pilot_rotate else np.complex64(1)
+    if pilot_cycle is None:
+        p = POLARITY[(sym_idx - 2) % 127]
+        for pv, sc in zip(PILOT_VAL, PILOT_SC):
+            freq[sc] = pv * p * rot
+    else:
+        p = POLARITY[(sym_idx - 4) % 127]
+        n = len(PILOT_VAL)
+        for k, sc in enumerate(PILOT_SC):
+            freq[sc] = PILOT_VAL[(k + pilot_cycle) % n] * p * rot
     return ofdm_symbol(freq)
 
 
@@ -319,17 +332,28 @@ def dup40(freq64):
     return f
 
 
-def data_symbol40(pts, sym_idx, rotate=False):
-    """One HT40 OFDM symbol (128-FFT) from 108 mapped points + 6 pilots."""
+def data_symbol40(pts, sym_idx, rotate=False, pilot_cycle=None):
+    """One HT40 OFDM symbol (128-FFT) from 108 mapped points + 6 pilots.
+
+    `pilot_cycle` (the 0-based data-symbol index) selects the 802.11 cycling DATA
+    pilots: the 6-pilot base {1,1,1,-1,-1,1} rotated by that index x POLARITY[sym-4]
+    (matches the chip-validated TX and the RX's HT40 data-pilot derotation)."""
     freq = np.zeros(128, dtype=np.complex64)
     pts = np.asarray(pts, dtype=np.complex64)
     if rotate:
         pts = pts * np.complex64(1j)
     for c, sc in enumerate(DATA_SC_HT40):
         freq[sc] = pts[c]
-    p = POLARITY[(sym_idx - 2) % 127]
-    for pv, sc in zip(PILOT_VAL_HT40, PILOT_SC_HT40):
-        freq[sc] = pv * p * (np.complex64(1j) if rotate else np.complex64(1))
+    rot = np.complex64(1j) if rotate else np.complex64(1)
+    if pilot_cycle is None:
+        p = POLARITY[(sym_idx - 2) % 127]
+        for pv, sc in zip(PILOT_VAL_HT40, PILOT_SC_HT40):
+            freq[sc] = pv * p * rot
+    else:
+        p = POLARITY[(sym_idx - 4) % 127]
+        n = len(PILOT_VAL_HT40)
+        for k, sc in enumerate(PILOT_SC_HT40):
+            freq[sc] = PILOT_VAL_HT40[(k + pilot_cycle) % n] * p * rot
     return ofdm_symbol(freq)
 
 
@@ -391,7 +415,7 @@ def gen_ht40(psdu, mcs=0):
     scr[16 + 8 * length:16 + 8 * length + 6] = 0
     coded = puncture(conv_encode(scr), rnum, rden)
     il = interleave_ht(coded, n_cbps, n_bpsc, bw=40)
-    data_syms = [data_symbol40(map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc), 7 + j)
+    data_syms = [data_symbol40(map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc), 7 + j, pilot_cycle=j)
                  for j in range(nsym)]
     return np.concatenate([preamble40(), sig, htsig1, htsig2, htstf, htltf]
                           + data_syms).astype(np.complex64)
@@ -440,7 +464,7 @@ def gen_ht(psdu, mcs=0, spec_pilots=False):
     coded = puncture(conv_encode(scr), rnum, rden)  # -> nsym*n_cbps
     il = interleave_ht(coded, n_cbps, n_bpsc)
     data_syms = [data_symbol(map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc),
-                             DATA_SC_HT, 7 + j) for j in range(nsym)]
+                             DATA_SC_HT, 7 + j, pilot_cycle=j) for j in range(nsym)]
     return np.concatenate([preamble(), sig, htsig1, htsig2, htstf, htltf]
                           + data_syms).astype(np.complex64)
 
@@ -570,7 +594,7 @@ def gen_vht(psdu, mcs=0, nss=1):
     coded = puncture(conv_encode(scr), rnum, rden)
     il = interleave_ht(coded, n_cbps, n_bpsc)       # VHT20 1SS == HT20 interleave
     data_syms = [data_symbol(map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc),
-                             DATA_SC_VHT20, 8 + j) for j in range(nsym)]
+                             DATA_SC_VHT20, 8 + j, pilot_cycle=j) for j in range(nsym)]
     return np.concatenate([preamble(), sig, vsiga1, vsiga2, vstf, vltf, vsigb]
                           + data_syms).astype(np.complex64)
 
@@ -904,8 +928,8 @@ def gen_ht_ldpc(psdu, mcs=0):
     nsym = int(np.ceil(n / ndsc))                # 13
     bits = np.zeros(nsym * ndsc, dtype=np.uint8)
     bits[:n] = cw
-    data_syms = [data_symbol(map_bpsk(bits[j * ndsc:(j + 1) * ndsc]), DATA_SC_HT, 7 + j)
-                 for j in range(nsym)]
+    data_syms = [data_symbol(map_bpsk(bits[j * ndsc:(j + 1) * ndsc]), DATA_SC_HT, 7 + j,
+                             pilot_cycle=j) for j in range(nsym)]
     return np.concatenate([preamble(), sig, htsig1, htsig2, htstf, htltf]
                           + data_syms).astype(np.complex64)
 
@@ -983,25 +1007,31 @@ def gen_ht_stbc(psdu, mcs=0, H=None):
     htstf = ofdm_symbol(LONG)
     pre = np.concatenate([preamble(), sig, htsig1, htsig2, htstf]).astype(np.complex64) * h0
 
-    # 2 HT-LTF via the P matrix across STS0/STS1, received on one antenna (h0,h1).
+    # 2 HT-LTF via the standard 802.11 HT-LTF P matrix across STS0/STS1 (STS0=[+,-],
+    # STS1=[+,+]) as real Realtek silicon and the chip-validated TX emit, received on
+    # one antenna (h0,h1): symbol0=h0+h1, symbol1=-h0+h1 so the RX recovers h0=(a-b)/2,
+    # h1=(a+b)/2. (The old [[1,-1],[1,1]] layout matched the deprecated RX formula.)
+    P_STBC = np.array([[1, 1], [-1, 1]], dtype=np.complex64)  # [ltf_sym, sts]
     def ltf_t(t):
         def f(sts):
             fr = np.zeros(64, dtype=np.complex64)
             for sc in range(4, 61):
-                fr[sc] = HTLTF20[sc] * P2[t, sts]
+                fr[sc] = HTLTF20[sc] * P_STBC[t, sts]
             return ofdm_symbol(fr)
         return (h0 * f(0) + h1 * f(1)).astype(np.complex64)
     ltf = [ltf_t(0), ltf_t(1)]
 
-    # Alamouti data, pilots on STS0.
+    # Alamouti data, cycling pilots on STS0 (base {1,1,1,-1} rotated by the data-symbol
+    # index sym_idx-8, x POLARITY[sym_idx-5]; STBC data starts at OFDM sym 8).
     def sym(pts, sym_idx, with_pilots):
         fr = np.zeros(64, dtype=np.complex64)
         for c, sc in enumerate(DATA_SC_HT):
             fr[sc] = pts[c]
         if with_pilots:
-            p = POLARITY[(sym_idx - 2) % 127]
-            for pv, sc in zip(PILOT_VAL, PILOT_SC):
-                fr[sc] = pv * p
+            p = POLARITY[(sym_idx - 5) % 127]
+            n = len(PILOT_VAL)
+            for k, sc in enumerate(PILOT_SC):
+                fr[sc] = PILOT_VAL[(k + sym_idx - 8) % n] * p
         return ofdm_symbol(fr)
     data = []
     for j in range(0, nsym, 2):
