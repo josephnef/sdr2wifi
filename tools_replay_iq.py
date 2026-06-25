@@ -41,7 +41,7 @@ class replay(gr.top_block):
         self._blocks = []                    # keep python refs alive for GR
         n_rx = 2 if a.infile2 else 1
         self.fe = ieee802_11.frame_equalizer(
-            ieee802_11.LS, freq, bw, False, False, fft_len, n_rx)
+            ieee802_11.LS, freq, bw, False, a.debug, fft_len, n_rx)
         self.dm = ieee802_11.decode_mac(False, False)
         self.dbg = blocks.message_debug()
 
@@ -107,6 +107,8 @@ def main():
     p.add_argument("--freq", type=float, default=5180e6)
     p.add_argument("--secs", type=float, default=0,
                    help="ignored; kept for compatibility (run() ends at EOF)")
+    p.add_argument("--debug", action="store_true",
+                   help="enable frame_equalizer debug output (HT-SIG sniff diagnostics)")
     a = p.parse_args()
     tb = replay(a)
     # Bound the work-chunk size so the gr-ieee802-11 sync blocks see uniform input
