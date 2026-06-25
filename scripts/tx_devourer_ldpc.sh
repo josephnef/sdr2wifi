@@ -10,6 +10,8 @@ cd "$(dirname "$0")/.."
 FORK="$HOME/git/gr-ieee802-11"
 DEVDIR="$HOME/git/devourer"
 CH="${CH:-1}" ; FREQ="${FREQ:-2412e6}" ; TXGAIN="${TXGAIN:-89}" ; SECS="${SECS:-20}"
+MCS="${MCS:-0}" ; TX_LEN="${TX_LEN:-24}" ; export TX_LEN   # TX_LEN>37 -> multi-codeword
+EXP=$((12 + MCS))
 
 export PREFIX="${GRWIFI_PREFIX:-$HOME/grwifi-install}"
 OOT=$(find "$PREFIX" -name ieee802_11 -type d -path '*packages*' | head -1); OOT="${OOT%/ieee802_11}"
@@ -23,8 +25,8 @@ trap cleanup EXIT INT TERM
 
 echo "[ldpc] building tx_gen ..."
 g++ -O2 -std=c++17 -I"$FORK/include" "$FORK/lib/tx/tx_gen.cc" "$FORK/lib/tx/wifi_tx.cc" -o "$TXBIN" || exit 1
-"$TXBIN" "$CAP" ldpc 0 20 2>/dev/null || exit 1
-echo "[ldpc] TX HT20 MCS0 LDPC @ ${FREQ}Hz ch$CH; expect DESC_RATE=12 crc_err=0 ldpc=1"
+"$TXBIN" "$CAP" ldpc "$MCS" 20 2>/dev/null || exit 1
+echo "[ldpc] TX HT20 MCS0 LDPC @ ${FREQ}Hz ch$CH; expect DESC_RATE=$EXP crc_err=0 ldpc=1 (MCS$MCS, TX_LEN=$TX_LEN)"
 
 sudo pkill -9 -x WiFiDriverDemo 2>/dev/null; sleep 2
 sudo env DEVOURER_PID=0x8812 DEVOURER_CHANNEL=$CH DEVOURER_STREAM_OUT=1 \
@@ -37,8 +39,8 @@ sudo pkill -9 -x WiFiDriverDemo 2>/dev/null; sleep 1
 
 echo "[ldpc] canonical-SA <devourer-stream> lines:"
 grep -a "devourer-stream" "$RXLOG" | head -4
-CLEAN=$(grep -c "rate=12 .*crc_err=0.* ldpc=1" "$RXLOG")
-echo "[ldpc] clean LDPC (rate=12 crc0 ldpc=1) frames: $CLEAN"
+CLEAN=$(grep -c "rate=$EXP .*crc_err=0.* ldpc=1" "$RXLOG")
+echo "[ldpc] clean LDPC (rate=$EXP crc0 ldpc=1) frames: $CLEAN"
 if [ "$CLEAN" -gt 0 ]; then
   echo "[ldpc] RESULT: PASS -- RTL8812AU received the fork's HT20 LDPC TX"
 else
