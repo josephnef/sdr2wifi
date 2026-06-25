@@ -231,17 +231,24 @@ def puncture(coded, num, den):
     return np.array(out, dtype=np.uint8)
 
 
-def data_symbol(pts, data_sc, sym_idx, rotate=False):
-    """One OFDM data/SIG symbol from pre-mapped constellation points + pilots."""
+def data_symbol(pts, data_sc, sym_idx, rotate=False, pilot_rotate=None):
+    """One OFDM data/SIG symbol from pre-mapped constellation points + pilots.
+
+    `rotate` rotates the DATA carriers by j (QBPSK). `pilot_rotate` controls the
+    pilots independently; it defaults to `rotate`. Spec HT-SIG / VHT-SIG-A QBPSK
+    symbols carry QBPSK DATA but BPSK PILOTS, so the RX derotation lands the data
+    on the imaginary axis -- pass rotate=True, pilot_rotate=False for those."""
+    if pilot_rotate is None:
+        pilot_rotate = rotate
     freq = np.zeros(64, dtype=np.complex64)
     pts = np.asarray(pts, dtype=np.complex64)
     if rotate:
-        pts = pts * np.complex64(1j)  # QBPSK (HT-SIG)
+        pts = pts * np.complex64(1j)  # QBPSK data
     for c, sc in enumerate(data_sc):
         freq[sc] = pts[c]
     p = POLARITY[(sym_idx - 2) % 127]
     for pv, sc in zip(PILOT_VAL, PILOT_SC):
-        freq[sc] = pv * p * (np.complex64(1j) if rotate else np.complex64(1))
+        freq[sc] = pv * p * (np.complex64(1j) if pilot_rotate else np.complex64(1))
     return ofdm_symbol(freq)
 
 
@@ -390,7 +397,12 @@ def gen_ht40(psdu, mcs=0):
                           + data_syms).astype(np.complex64)
 
 
-def gen_ht(psdu, mcs=0):
+def gen_ht(psdu, mcs=0, spec_pilots=False):
+    # spec_pilots=True emits HT-SIG with BPSK (un-rotated) pilots + QBPSK data, exactly
+    # like real Realtek silicon: after the RX's pilot derotation the data lands on the
+    # IMAGINARY axis (decoded via the fork's eq_q path). The default (spec_pilots=False)
+    # rotates the pilots too, landing data on the real axis -- which is what the rest of
+    # the synthetic regression exercises, leaving the eq_q path untested over the air.
     n_bpsc, rnum, rden, n_cbps, n_dbps = HT_MCS[mcs]
     length = len(psdu)
     nsym = int(np.ceil((16 + 8 * length + 6) / n_dbps))
@@ -410,14 +422,15 @@ def gen_ht(psdu, mcs=0):
     for i in range(8):
         hsig[34 + i] = (crc >> (7 - i)) & 1   # MSB-first c7..c0
     hsig_il = interleave(conv_encode(hsig), 48, 1)  # 96, legacy 48-interleaver
-    htsig1 = data_symbol(map_bpsk(hsig_il[0:48]), DATA_SC_LEGACY, 3, rotate=True)
-    htsig2 = data_symbol(map_bpsk(hsig_il[48:96]), DATA_SC_LEGACY, 4, rotate=True)
+    pr = False if spec_pilots else None  # None -> pilot_rotate follows rotate (=True)
+    htsig1 = data_symbol(map_bpsk(hsig_il[0:48]), DATA_SC_LEGACY, 3, rotate=True, pilot_rotate=pr)
+    htsig2 = data_symbol(map_bpsk(hsig_il[48:96]), DATA_SC_LEGACY, 4, rotate=True, pilot_rotate=pr)
 
-    # HT-STF (sym5), HT-LTF (sym6) -- RX skips both. Use FULL-BAND symbols (not
-    # the periodic short-training pattern) so sync_short does not re-trigger
-    # mid-frame and corrupt the symbol alignment.
+    # HT-STF (sym5): full-band LONG (RX skips it). HT-LTF (sym6): the spec HTLTF20 so
+    # the RX estimates the HT20 data channel (incl. +-27/+-28 edge tones) from it --
+    # matches the decoder's ht_estimate_ltf20 and what real Realtek silicon emits.
     htstf = ofdm_symbol(LONG)
-    htltf = ofdm_symbol(LONG)
+    htltf = ofdm_symbol(HTLTF20)
 
     # HT DATA: scramble -> conv 1/2 -> puncture(rate) -> HT-interleave -> QAM map
     data_bits = np.zeros(nsym * n_dbps, dtype=np.uint8)
@@ -448,6 +461,118 @@ N_ROT_20 = 11  # HT20 interleaver frequency-rotation unit
 # Default synthetic 2x2 channel. Off-diagonal terms are non-zero so BOTH RX antennas
 # receive the (TX-antenna-0) legacy preamble -> both sync chains lock and co-index.
 H_MIMO_DEFAULT = np.array([[1.0, 0.3 + 0.2j], [-0.2 + 0.1j, 0.9]], dtype=np.complex64)
+
+
+# ---- 802.11ac VHT (SU, NSS=1, 20 MHz, MCS 0-7, BCC) --------------------------
+# VHT 20 MHz reuses the HT20 subcarrier geometry: 52 data tones (bins 4..60 minus
+# DC + the 4 pilots {11,25,39,53}) and the same per-MCS modulation/coding. So for
+# NSS=1 MCS 0-7 the data N_BPSC/rate/N_CBPS/N_DBPS are identical to HT_MCS, and we
+# reuse that table. (MCS 8-9 = 256-QAM need an 8-bpsc constellation -> follow-up.)
+VHT_MCS = HT_MCS  # NSS=1, 20 MHz: same (n_bpsc, rnum, rden, n_cbps, n_dbps) as HT
+DATA_SC_VHT20 = DATA_SC_HT  # 52 data tones, bins 4..60 minus DC + pilots
+
+# VHT-LTF (20 MHz, 1 stream): same occupied tones as HT-LTF20 so a single-stream
+# channel estimate covers every VHT20 data/pilot subcarrier (bins 4..60).
+VHTLTF20 = HTLTF20
+
+
+def vht_sig_a_bits(mcs, nss, bw=0, stbc=0, sgi=0, ldpc=0):
+    """48 VHT-SIG-A info bits (SU). Layout per 802.11-2016 Table 21-12/21-13:
+      SIG-A1 (24): B0-1 BW, B2 reserved(=1), B3 STBC, B4-9 Group ID,
+                   B10-12 NSTS(=NSS-1), B13-21 Partial AID, B22 TXOP_PS_NOT_ALLOWED,
+                   B23 reserved(=1).
+      SIG-A2 (24): B0 Short GI, B1 SGI-Nsym-disambig, B2 SU-coding(0=BCC),
+                   B3 LDPC-extra, B4-7 VHT-MCS, B8 Beamformed, B9 reserved(=1),
+                   B10-17 CRC-8, B18-23 tail(=0).
+    SU uses Group ID 0 (to-AP) so the VHT/HT discriminator is the BPSK-then-QBPSK
+    pair, not the group id. CRC-8 is over the 34 bits B0..B33 (A1 + A2 B0..B9)."""
+    b = np.zeros(48, dtype=np.uint8)
+    # --- SIG-A1 ---
+    b[0] = bw & 1
+    b[1] = (bw >> 1) & 1
+    b[2] = 1                      # reserved
+    b[3] = stbc & 1
+    # B4-9 Group ID = 0 (SU, to AP)
+    nsts = (nss - 1) & 0x7
+    for i in range(3):
+        b[10 + i] = (nsts >> i) & 1
+    # B13-21 Partial AID = 0
+    b[22] = 0                     # TXOP_PS_NOT_ALLOWED
+    b[23] = 1                     # reserved
+    # --- SIG-A2 ---
+    b[24] = sgi & 1
+    b[25] = 0                     # SGI Nsym disambiguation
+    b[26] = ldpc & 1             # SU coding: 0=BCC, 1=LDPC
+    b[27] = 0                     # LDPC extra symbol
+    for i in range(4):
+        b[28 + i] = (mcs >> i) & 1   # B4-7 VHT-MCS
+    b[32] = 0                     # Beamformed
+    b[33] = 1                     # reserved
+    crc = ht_sig_crc8(b[0:34])  # same CRC-8 as HT-SIG
+    for i in range(8):
+        b[34 + i] = (crc >> (7 - i)) & 1   # MSB-first c7..c0
+    # B18-23 (b[42:48]) tail = 0
+    return b
+
+
+def vht_sig_b_bits_20(length):
+    """26 VHT-SIG-B info bits (SU, 20 MHz). B0-16 APEP-Length in 4-octet units
+    (17 bits), B17-19 reserved(=1), B20-25 tail(=0). The decoder derives the data
+    symbol count from VHT-SIG-A MCS + this length."""
+    b = np.zeros(26, dtype=np.uint8)
+    apep = (length + 3) // 4
+    for i in range(17):
+        b[i] = (apep >> i) & 1
+    b[17] = b[18] = b[19] = 1     # reserved
+    return b
+
+
+def gen_vht(psdu, mcs=0, nss=1):
+    """Single-stream VHT (SU, 20 MHz, MCS 0-7, BCC, long GI) time-domain capture.
+    Frame: L-STF | L-LTF | L-SIG | VHT-SIG-A1(BPSK) | VHT-SIG-A2(QBPSK) | VHT-STF |
+    VHT-LTF | VHT-SIG-B(BPSK) | VHT-DATA. The BPSK-then-QBPSK SIG-A pair is the
+    format discriminator vs HT (QBPSK-QBPSK)."""
+    if mcs > 7:
+        raise ValueError("gen_vht supports MCS 0-7 (256-QAM MCS8/9 TODO)")
+    n_bpsc, rnum, rden, n_cbps, n_dbps = VHT_MCS[mcs]
+    length = len(psdu)
+    nsym = int(np.ceil((16 + 8 * length + 6) / n_dbps))
+    # L-SIG length must cover the whole VHT PPDU (legacy receivers defer on it).
+    lsig_len = max(length + 16, 40)
+    sig = data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 2)
+
+    # VHT-SIG-A: 48 info bits -> conv 1/2 -> 96 coded -> legacy 48-interleave ->
+    # symbol 1 BPSK (NOT rotated), symbol 2 QBPSK (rotated).
+    siga = vht_sig_a_bits(mcs, nss)
+    siga_il = interleave(conv_encode(siga), 48, 1)
+    # Spec VHT-SIG-A: A1 BPSK, A2 QBPSK DATA with BPSK PILOTS (pilot_rotate=False),
+    # so the RX lands A1 on the real axis and A2 on the imaginary axis (mixed).
+    vsiga1 = data_symbol(map_bpsk(siga_il[0:48]), DATA_SC_LEGACY, 3, rotate=False)
+    vsiga2 = data_symbol(map_bpsk(siga_il[48:96]), DATA_SC_LEGACY, 4,
+                         rotate=True, pilot_rotate=False)
+
+    # VHT-STF (sym5, RX skips) + VHT-LTF (sym6, single-stream channel estimate).
+    vstf = ofdm_symbol(LONG)
+    vltf = ofdm_symbol(VHTLTF20)
+
+    # VHT-SIG-B: 26 info bits -> conv 1/2 -> 52 coded -> BPSK over the 52 data tones.
+    sigb = vht_sig_b_bits_20(length)
+    sigb_coded = conv_encode(sigb)            # 52
+    vsigb = data_symbol(map_bpsk(sigb_coded), DATA_SC_VHT20, 7)
+
+    # VHT-DATA: scramble -> conv 1/2 -> puncture(rate) -> HT-interleave -> QAM map.
+    # VHT prepends an 8-bit VHT-SIG-B CRC to the SERVICE field region; we keep the
+    # existing SERVICE(16)+PSDU+tail layout the decoder already inverts.
+    data_bits = np.zeros(nsym * n_dbps, dtype=np.uint8)
+    data_bits[16:16 + 8 * length] = bytes_to_bits(psdu)
+    scr = scramble(data_bits)
+    scr[16 + 8 * length:16 + 8 * length + 6] = 0   # tail
+    coded = puncture(conv_encode(scr), rnum, rden)
+    il = interleave_ht(coded, n_cbps, n_bpsc)       # VHT20 1SS == HT20 interleave
+    data_syms = [data_symbol(map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc),
+                             DATA_SC_VHT20, 8 + j) for j in range(nsym)]
+    return np.concatenate([preamble(), sig, vsiga1, vsiga2, vstf, vltf, vsigb]
+                          + data_syms).astype(np.complex64)
 
 
 def stream_parse(coded, n_ss, n_bpsc, n_cbps_ss):
@@ -667,6 +792,226 @@ def mimo_selftest(mcs=8, H=None):
     return ok
 
 
+# ---- 802.11n HT STBC (1 spatial stream -> 2 space-time streams, Alamouti) -------
+# STBC=1 with 1 SS: the single BCC stream's QAM symbols are Alamouti-encoded across
+# symbol PAIRS onto 2 space-time streams (2 TX antennas), giving transmit diversity.
+# Per data subcarrier, for a symbol pair (s0, s1):
+#   STS0 (ant0): [ s0,        s1      ]
+#   STS1 (ant1): [ -conj(s1), conj(s0)]   (standard Alamouti)
+# RX (1 antenna) through channels h0 (STS0->rx), h1 (STS1->rx) recovers s0, s1 by
+# Alamouti combining: s0 = (h0* y0 + h1 y1*)/g ; s1 = -(h1* y0 - h0 y1*)*/g,
+# g = |h0|^2+|h1|^2 (cross-terms cancel; full diversity order 2).
+H_STBC_DEFAULT = np.array([0.9 + 0.2j, 0.4 - 0.6j], dtype=np.complex64)  # [h0, h1]
+
+
+def ht_stbc_symbols(psdu, mcs):
+    """Single-stream HT QAM data symbols (52-pt vectors per OFDM symbol) + the coded
+    bits, for STBC. Same per-stream coding as SISO HT MCS 0-7."""
+    n_bpsc, rnum, rden, n_cbps, n_dbps = HT_MCS[mcs]
+    length = len(psdu)
+    nsym = int(np.ceil((16 + 8 * length + 6) / n_dbps))
+    if nsym % 2:
+        nsym += 1  # Alamouti needs an even number of OFDM symbols (symbol pairs)
+    data_bits = np.zeros(nsym * n_dbps, dtype=np.uint8)
+    data_bits[16:16 + 8 * length] = bytes_to_bits(psdu)
+    scr = scramble(data_bits)
+    scr[16 + 8 * length:16 + 8 * length + 6] = 0
+    coded = puncture(conv_encode(scr), rnum, rden)
+    il = interleave_ht(coded, n_cbps, n_bpsc)
+    syms = [map_qam(il[j * n_cbps:(j + 1) * n_cbps], n_bpsc) for j in range(nsym)]
+    return syms, nsym, coded, n_bpsc, n_cbps
+
+
+def stbc_selftest(mcs=0, H=None):
+    """Bit-exact reference: Alamouti-encode the HT data to 2 STS, pass through a
+    frequency-flat 2x1 channel, Alamouti-combine, demap + deinterleave, and check the
+    recovered coded bits equal the transmitted ones. Proves the STBC data model is
+    invertible (the C++ RX must reproduce this)."""
+    if H is None:
+        H = H_STBC_DEFAULT
+    h0, h1 = H[0], H[1]
+    g = (abs(h0) ** 2 + abs(h1) ** 2)
+    psdu = make_psdu()
+    syms, nsym, coded_tx, n_bpsc, n_cbps = ht_stbc_symbols(psdu, mcs)
+    ndsc = len(DATA_SC_HT)  # 52
+    rec = np.zeros(nsym * n_cbps, dtype=np.uint8)
+    for j in range(0, nsym, 2):           # per symbol pair
+        s0 = syms[j]; s1 = syms[j + 1]    # 52-pt each
+        # Alamouti TX onto 2 STS, RX over 2 time slots (frequency-flat channel):
+        y0 = h0 * s0 + h1 * (-np.conj(s1))   # time slot 0
+        y1 = h0 * s1 + h1 * np.conj(s0)      # time slot 1
+        s0_hat = (np.conj(h0) * y0 + h1 * np.conj(y1)) / g
+        s1_hat = (np.conj(h1) * y0 - h0 * np.conj(y1)) / g
+        s1_rec = -np.conj(s1_hat)            # s1_hat = -conj(s1) -> s1 = -conj(s1_hat)
+        for sym_off, srec in ((0, s0_hat), (1, s1_rec)):
+            bits = []
+            for c in range(ndsc):
+                bits.extend(demap_qam(srec[c], n_bpsc))
+            rec[(j + sym_off) * n_cbps:(j + sym_off + 1) * n_cbps] = bits
+    # deinterleave each symbol back to coded order
+    deint = np.zeros_like(rec)
+    s = max(n_bpsc // 2, 1); n_col = 13; n_row = 4 * n_bpsc
+    for sym in range(nsym):
+        base = sym * n_cbps
+        for k in range(n_cbps):
+            i = n_row * (k % n_col) + (k // n_col)
+            jj = s * (i // s) + (i + n_cbps - (n_col * i) // n_cbps) % s
+            deint[base + k] = rec[base + jj]
+    ok = np.array_equal(deint[:len(coded_tx)], coded_tx)
+    nerr = int(np.sum(deint[:len(coded_tx)] != coded_tx))
+    print(f"[stbc-selftest] mcs={mcs} nsym={nsym} coded_bits={len(coded_tx)} "
+          f"bit_errors={nerr} -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def gen_ht_ldpc(psdu, mcs=0):
+    """HT frame with one R=1/2 n=648 LDPC codeword as the data (HT-SIG fec=1, BPSK).
+    Self-consistent with the fork's fec==1 path: the 648 codeword bits map to the HT20
+    data tones in order (no BCC interleave), so the RX collects them in order and runs
+    the validated min-sum LDPC decoder. Info = SERVICE(16)+scrambled-PSDU+pad (324)."""
+    import ldpc as _l
+    base, Z = _l.CODES["R12_648"]
+    H = _l.build_H(base, Z); P, ic, pc = _l.gf2_systematic(H)
+    k, n = len(ic), H.shape[1]
+    length = (k - 16) // 8                       # 38B PSDU (incl FCS) for this codeword
+    length = len(psdu)                           # caller passes the right-sized PSDU
+    info = np.zeros(k, dtype=np.uint8)
+    db = np.zeros(16 + 8 * length, dtype=np.uint8)
+    db[16:16 + 8 * length] = bytes_to_bits(psdu)
+    info[:len(db)] = scramble(db)
+    cw = _l.encode(info, P, ic, pc, n)           # 648 coded bits
+
+    lsig_len = max(length + 16, 60)
+    sig = data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 2)
+    hsig = np.zeros(48, dtype=np.uint8)
+    for i in range(7):
+        hsig[i] = (mcs >> i) & 1
+    hsig[7] = 0                                  # CBW20
+    for i in range(16):
+        hsig[8 + i] = (length >> i) & 1
+    hsig[30] = 1                                 # FEC = LDPC
+    crc = ht_sig_crc8(hsig[0:34])
+    for i in range(8):
+        hsig[34 + i] = (crc >> (7 - i)) & 1
+    hsig_il = interleave(conv_encode(hsig), 48, 1)
+    htsig1 = data_symbol(map_bpsk(hsig_il[0:48]), DATA_SC_LEGACY, 3, rotate=True)
+    htsig2 = data_symbol(map_bpsk(hsig_il[48:96]), DATA_SC_LEGACY, 4, rotate=True)
+    htstf = ofdm_symbol(LONG)
+    htltf = ofdm_symbol(HTLTF20)
+
+    # LDPC data: 648 BPSK bits -> HT20 data tones in order (no interleave), 13 symbols.
+    ndsc = len(DATA_SC_HT)                        # 52
+    nsym = int(np.ceil(n / ndsc))                # 13
+    bits = np.zeros(nsym * ndsc, dtype=np.uint8)
+    bits[:n] = cw
+    data_syms = [data_symbol(map_bpsk(bits[j * ndsc:(j + 1) * ndsc]), DATA_SC_HT, 7 + j)
+                 for j in range(nsym)]
+    return np.concatenate([preamble(), sig, htsig1, htsig2, htstf, htltf]
+                          + data_syms).astype(np.complex64)
+
+
+def ldpc_data_selftest(code="R12_648"):
+    """Bit-exact LDPC DATA-path self-test: take a real PSDU (correct FCS), build the
+    802.11 LDPC info block (SERVICE(16) + scrambled data, no BCC tail), LDPC-encode,
+    BPSK + light noise, min-sum decode, descramble, and check the FCS residue. Proves
+    the full PSDU<->LDPC-codeword<->CRC path the fork's fec==1 branch will run."""
+    import ldpc
+    base, Z = ldpc.CODES[code]
+    H = ldpc.build_H(base, Z)
+    P, info_cols, par_cols = ldpc.gf2_systematic(H)
+    n = H.shape[1]
+    k = len(info_cols)
+    # PSDU sized so SERVICE(16)+8*len fits the info block; pad the rest (shortening).
+    length = (k - 16) // 8                          # full PSDU bytes (data + 4B FCS)
+    psdu = make_psdu(length - 4)                    # make_psdu appends the 4B FCS
+    info = np.zeros(k, dtype=np.uint8)
+    databits = np.zeros(16 + 8 * length, dtype=np.uint8)
+    databits[16:16 + 8 * length] = bytes_to_bits(psdu)
+    scr = scramble(databits)                       # SERVICE+PSDU scrambled (no tail)
+    info[:len(scr)] = scr
+    cw = ldpc.encode(info, P, info_cols, par_cols, n)
+    tx = 1 - 2 * cw.astype(float)
+    rng = np.random.default_rng(0)
+    sigma = 10 ** (-6 / 20)
+    llr = 2 * (tx + rng.normal(0, sigma, n)) / sigma ** 2
+    dec = ldpc.min_sum_decode(llr, H, iters=50)
+    rec_info = dec[info_cols]
+    # descramble (seed from first 7 bits) -> recover PSDU bytes
+    state = 0
+    for i in range(7):
+        if rec_info[i]:
+            state |= 1 << (6 - i)
+    out = bytearray(length + 2)
+    out[0] = state
+    for i in range(7, length * 8 + 16):
+        fb = ((state >> 6) & 1) ^ ((state >> 3) & 1)
+        out[i // 8] |= (fb ^ int(rec_info[i])) << (i % 8)
+        state = ((state << 1) & 0x7e) | fb
+    crc = zlib.crc32(bytes(out[2:2 + length])) & 0xffffffff
+    ok = (crc == 0x2144DF1C)
+    print(f"[ldpc-data-selftest] code={code} len={length} FCS "
+          f"{'PASS' if ok else 'fail'} (crc=0x{crc:08x})")
+    return ok
+
+
+def gen_ht_stbc(psdu, mcs=0, H=None):
+    """Full HT STBC frame (1 SS -> 2 STS Alamouti, HT20) as a 1-RX-antenna capture.
+    Legacy preamble / L-SIG / HT-SIG (STBC=1) / HT-STF are sent on STS0 (via h0); the
+    2 HT-LTF use the P matrix across the 2 STS (so the RX recovers h0,h1 on one
+    antenna); the data is Alamouti-mapped across symbol pairs. Pilots ride STS0."""
+    if H is None:
+        H = H_STBC_DEFAULT
+    h0, h1 = H[0], H[1]
+    syms, nsym, coded, n_bpsc, n_cbps = ht_stbc_symbols(psdu, mcs)
+    length = len(psdu)
+    lsig_len = max(length + 16, 40)
+
+    sig = data_symbol(map_bpsk(sig_field(11, lsig_len)), DATA_SC_LEGACY, 2)
+    hsig = np.zeros(48, dtype=np.uint8)
+    for i in range(7):
+        hsig[i] = (mcs >> i) & 1
+    hsig[7] = 0                                  # CBW20
+    for i in range(16):
+        hsig[8 + i] = (length >> i) & 1
+    hsig[28] = 1                                 # STBC = 1 (one extra space-time stream)
+    crc = ht_sig_crc8(hsig[0:34])
+    for i in range(8):
+        hsig[34 + i] = (crc >> (7 - i)) & 1
+    hsig_il = interleave(conv_encode(hsig), 48, 1)
+    htsig1 = data_symbol(map_bpsk(hsig_il[0:48]), DATA_SC_LEGACY, 3, rotate=True)
+    htsig2 = data_symbol(map_bpsk(hsig_il[48:96]), DATA_SC_LEGACY, 4, rotate=True)
+    htstf = ofdm_symbol(LONG)
+    pre = np.concatenate([preamble(), sig, htsig1, htsig2, htstf]).astype(np.complex64) * h0
+
+    # 2 HT-LTF via the P matrix across STS0/STS1, received on one antenna (h0,h1).
+    def ltf_t(t):
+        def f(sts):
+            fr = np.zeros(64, dtype=np.complex64)
+            for sc in range(4, 61):
+                fr[sc] = HTLTF20[sc] * P2[t, sts]
+            return ofdm_symbol(fr)
+        return (h0 * f(0) + h1 * f(1)).astype(np.complex64)
+    ltf = [ltf_t(0), ltf_t(1)]
+
+    # Alamouti data, pilots on STS0.
+    def sym(pts, sym_idx, with_pilots):
+        fr = np.zeros(64, dtype=np.complex64)
+        for c, sc in enumerate(DATA_SC_HT):
+            fr[sc] = pts[c]
+        if with_pilots:
+            p = POLARITY[(sym_idx - 2) % 127]
+            for pv, sc in zip(PILOT_VAL, PILOT_SC):
+                fr[sc] = pv * p
+        return ofdm_symbol(fr)
+    data = []
+    for j in range(0, nsym, 2):
+        s0, s1 = syms[j], syms[j + 1]
+        y0 = h0 * sym(s0, 8 + j, True) + h1 * sym(-np.conj(s1), 8 + j, False)
+        y1 = h0 * sym(s1, 8 + j + 1, True) + h1 * sym(np.conj(s0), 8 + j + 1, False)
+        data += [y0.astype(np.complex64), y1.astype(np.complex64)]
+    return np.concatenate([pre] + ltf + data).astype(np.complex64)
+
+
 def make_psdu(payload_len=24):
     # minimal 802.11 data-ish MPDU + correct CRC-32 FCS (zlib == RX residue)
     mpdu = bytes([0x08, 0x01, 0x00, 0x00] + [0xff] * 6 +
@@ -679,7 +1024,8 @@ def make_psdu(payload_len=24):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["legacy", "ht", "ht40", "ht_mimo"], default="ht")
+    p.add_argument("--mode", choices=["legacy", "ht", "ht_spec", "ht40", "ht_mimo", "vht", "stbc", "ldpc"],
+                   default="ht")
     p.add_argument("--mcs", type=int, default=0)
     p.add_argument("--out", default="/tmp/wifi.cf32")
     p.add_argument("--reps", type=int, default=20, help="repeat the frame N times")
@@ -692,6 +1038,13 @@ def main():
     if a.mode == "ht_mimo" and a.selftest:
         mcs = a.mcs if a.mcs >= 8 else 8
         sys.exit(0 if mimo_selftest(mcs) else 1)
+
+    if a.mode == "stbc" and a.selftest:  # bit-exact Alamouti STBC data-model self-test
+        sys.exit(0 if stbc_selftest(a.mcs) else 1)
+
+    if a.mode == "ldpc" and a.selftest:  # LDPC data-path (PSDU<->codeword<->CRC) self-test
+        sys.exit(0 if all(ldpc_data_selftest(c) for c in
+                          ("R12_648", "R23_648", "R34_648", "R56_648", "R12_1944")) else 1)
 
     psdu = make_psdu()
 
@@ -720,6 +1073,15 @@ def main():
         frame = gen_legacy(psdu)
     elif a.mode == "ht40":
         frame = gen_ht40(psdu, a.mcs)
+    elif a.mode == "vht":
+        frame = gen_vht(psdu, a.mcs)
+    elif a.mode == "stbc":
+        frame = gen_ht_stbc(psdu, a.mcs)
+    elif a.mode == "ldpc":
+        psdu = make_psdu(34)            # 38B PSDU = exactly one R12_648 LDPC codeword
+        frame = gen_ht_ldpc(psdu, a.mcs)
+    elif a.mode == "ht_spec":
+        frame = gen_ht(psdu, a.mcs, spec_pilots=True)  # BPSK pilots -> data on imag axis (eq_q path)
     else:
         frame = gen_ht(psdu, a.mcs)
 
