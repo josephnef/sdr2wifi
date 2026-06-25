@@ -15,7 +15,9 @@ The decoder lives in a **separate repo** — `~/git/gr-ieee802-11`
 - 802.11n HT20 SISO (MCS 0–7, 20 MHz, 64-FFT)
 - 802.11n HT40 SISO (MCS 0–7, 40 MHz, 128-FFT)
 - 802.11n HT20 2×2 MIMO (MCS 8–15, 20 MHz, 64-FFT, MMSE separation)
-- 802.11ac VHT: **extension seams only** (enums / format / FEC type), no decode
+- 802.11ac VHT SU SISO (MCS 0-7, 20 MHz, 64-FFT, BCC): VHT-SIG-A (BPSK+QBPSK) +
+  VHT-SIG-B length + VHT data decode. 256-QAM (MCS 8-9), 40/80 MHz, NSS>1, LDPC
+  not yet decoded. Synthetic generator: `--mode vht`.
 
 This repo holds the flowgraphs and the test tooling; behavioral changes to the *decode* go
 in the fork, not here.
