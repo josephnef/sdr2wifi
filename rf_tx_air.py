@@ -38,6 +38,11 @@ class rf_tx_air(gr.top_block):
         # cf32 capture -> optional amplitude trim -> B210 TX. file_source repeats so
         # the framed burst train streams continuously for the whole --secs window.
         self.fsrc = blocks.file_source(gr.sizeof_gr_complex, a.infile, repeat=True)
+        # Large output buffers keep the USRP sink fed at 20 MS/s -- without this the
+        # scheduler starves the TX (continuous underflows) whenever the host is busy
+        # (e.g. a devourer RX is hammering USB on the same box), which corrupts the
+        # burst train. 1<<22 samples per the project's documented constraint.
+        self.fsrc.set_min_output_buffer(1 << 22)
         self.amp = blocks.multiply_const_cc(a.amp)
 
         self.snk = uhd.usrp_sink(
