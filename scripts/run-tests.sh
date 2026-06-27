@@ -172,6 +172,16 @@ else
     echo "  SKIP loopback (gr-foo not installed)"
 fi
 
+echo "== Soft-decision Viterbi coding gain (GR_SOFT_VITERBI; soft >= hard) =="
+# RX-only (file_source), no gr-foo needed. Forward-compatible: on a fork without
+# the soft path GR_SOFT_VITERBI is ignored (soft == hard) and this still passes;
+# once deps.env pins the soft fork it shows the coding gain.
+if timeout 150 python3 soft_viterbi_check.py --mcs 3 --snr 12 --reps 60 2>/dev/null | grep -q 'RESULT: PASS'; then
+    ok "soft-viterbi (soft >= hard)"
+else
+    bad "soft-viterbi"
+fi
+
 echo
 if [ "$FAILURES" -eq 0 ]; then echo "ALL TESTS PASSED"; exit 0; fi
 echo "$FAILURES TEST(S) FAILED"; exit 1
