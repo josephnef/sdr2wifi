@@ -128,6 +128,9 @@ class wifi_phy_hier(gr.hier_block2):
         self.connect((self.fft_vxx_0_1, 0), (self.ieee802_11_frame_equalizer_0, 0))
         self.connect((self.ieee802_11_chunks_to_symbols_xx_0, 0), (self.blocks_tagged_stream_mux_0, 1))
         self.connect((self.ieee802_11_frame_equalizer_0, 0), (self.ieee802_11_decode_mac_0, 0))
+        # Optional soft port (per-coded-bit LLRs) for decode_mac's GR_SOFT_VITERBI
+        # legacy decode; carried in lockstep with port 0.
+        self.connect((self.ieee802_11_frame_equalizer_0, 1), (self.ieee802_11_decode_mac_0, 1))
         self.connect((self.ieee802_11_mapper_0, 0), (self.digital_packet_headergenerator_bb_0, 0))
         self.connect((self.ieee802_11_mapper_0, 0), (self.ieee802_11_chunks_to_symbols_xx_0, 0))
         self.connect((self, 0), (self.blocks_complex_to_mag_squared_0, 0))
