@@ -95,6 +95,16 @@ class wifi_phy_hier(gr.hier_block2):
         # Connections
         ##################################################
         self.msg_connect((self.ieee802_11_decode_mac_0, 'out'), (self, 'mac_out'))
+        # HT/VHT/MIMO are decoded in frame_equalizer (not decode_mac); forward its
+        # 'pdu' port to mac_out too so modern-OFDM frames reach subscribers. NOTE:
+        # mirror this in examples/wifi_phy_hier.grc (the grcc source) when regenerating.
+        # Guarded: a fork without the 'pdu' port (pre-keep-corrupted, e.g. the
+        # CI-pinned commit in deps.env) lacks it — degrade to legacy-only mac_out
+        # rather than failing flowgraph construction.
+        try:
+            self.msg_connect((self.ieee802_11_frame_equalizer_0, 'pdu'), (self, 'mac_out'))
+        except Exception:
+            pass
         self.msg_connect((self.ieee802_11_frame_equalizer_0, 'symbols'), (self, 'carrier'))
         self.msg_connect((self, 'mac_in'), (self.ieee802_11_mapper_0, 'in'))
         self.connect((self.blocks_complex_to_mag_0, 0), (self.blocks_divide_xx_0, 0))

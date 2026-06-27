@@ -8,11 +8,13 @@ It proves the gr-ieee802-11 RX chain against a genuine over-air transmitter.
 
   RTL8812AU  --(legacy 6 Mbps OFDM, ch36 / 5180 MHz, 20 MHz)-->  air  -->  B210 RXB
 
-CRITICAL: gr-ieee802-11 decodes only *legacy* OFDM (802.11a/g/p), not HT/VHT. The
-matching transmitter is devourer's PrecoderDemo, which emits legacy 6 Mbps OFDM:
+This fork decodes legacy 802.11a/g/p AND modern OFDM (HT20/HT40 SISO, 2x2 MIMO,
+VHT-SU SISO) — the format-detecting equalizer reads each frame's SIG. A simple
+legacy transmitter is devourer's PrecoderDemo (legacy 6 Mbps OFDM):
   cd ~/git/devourer && head -c 64 /dev/urandom > /tmp/psdu.bin
   sudo DEVOURER_PID=0x8812 DEVOURER_CHANNEL=36 \
        ./build/PrecoderDemo --psdu /tmp/psdu.bin --interval-ms 2
+StreamTxDemo (DEVOURER_TX_RATE=MCS0..7) emits HT20, also decodable here.
 
 Both sides MUST share center frequency (5180 MHz) and 20 MHz bandwidth.
 

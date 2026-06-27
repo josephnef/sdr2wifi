@@ -87,6 +87,35 @@ After editing the fork, rebuild and **re-install** into the prefix, then re-run 
 cmake --build ~/git/gr-ieee802-11/build -j && cmake --install ~/git/gr-ieee802-11/build
 ```
 
+## Corrupt-frame surfacing + fused FEC (rung-3)
+
+`GR_KEEP_CORRUPTED=1` makes the fork publish FCS-failed PSDUs tagged `crc_ok=#f`
+instead of dropping them — the SDR-side mirror of devourer's
+`DEVOURER_RX_KEEP_CORRUPTED`, so a downstream sub-block-integrity (SBI) layer can
+salvage the CRC-valid sub-blocks. It touches two decode paths because legacy and
+modern OFDM are decoded in different blocks:
+
+- `lib/decode_mac.cc` — surfaces FCS-failed **legacy** frames.
+- `lib/frame_equalizer_impl.cc` — HT/VHT/MIMO are decoded *here* (in
+  `ht_finish`/`vht_finish`/`mimo_finish`), not in `decode_mac`. They previously
+  only printed `[HT-DATA] CRC-32 PASS/fail`; a new `pdu` message port
+  (`publish_pdu`) now publishes them with `crc_ok`. `wifi_phy_hier.py` forwards
+  `frame_equalizer 'pdu' → mac_out` (mirror this in the `.grc` on regen).
+
+Fused-FEC harness (this repo), pairing a devourer chip TX with the SDR RX:
+
+- `fused_fec_rung3.py` — over-real-air RX: devourer 8812 (HT MCS7) → B210 →
+  fork decode (`GR_KEEP_CORRUPTED`) → SBI salvage (`run_fused_rung3.sh` drives
+  it). Reuses devourer's `tools/precoder` FEC stack (RS path is numpy-free).
+- `fused_fec_rung1.py` — the software-channel capstone (TX+channel+RX in one
+  flowgraph), the no-hardware analog.
+- `keep_corrupted_check.py` / `ht_hier_check.py` — validate FCS-failed surfacing
+  and HT-PDU-through-`mac_out` respectively.
+
+Architecture + results: `~/git/devourer/docs/fused-fec.md`. NB: the SDR over-air
+SBI gain is currently small — the hard-decision Viterbi corrupts marginal frames
+frame-wide; a soft-decision RX path is the unlock (see that doc's Future work).
+
 ## Environment that must be in place
 
 The scripts import `ieee802_11` and `foo` as installed Python modules and fail to import
