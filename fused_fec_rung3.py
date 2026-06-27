@@ -105,6 +105,19 @@ def main():
         meta, blob = pmt.car(msg), pmt.cdr(msg)
         if not pmt.is_u8vector(blob):
             continue
+        # Drop legacy "ghost" PDUs. The devourer TX sends mixed-format HT frames;
+        # the fork's decode_mac ALSO decodes each HT frame's legacy L-SIG cover as
+        # a 6 Mbps legacy frame -> garbage -> CRC fail, and GR_KEEP_CORRUPTED
+        # surfaces it. Every real HT frame thus yields one HT PDU (the real data)
+        # plus one legacy ghost PDU. Feeding the ghosts to SBI is harmless (they
+        # fail the sub-block CRCs) but doubles frames_seen and makes every real
+        # frame look like a 50% corruption rate. Keep only encoding>=HT so the
+        # corrupt metric reflects the actual link.
+        enc = pmt.dict_ref(meta, pmt.intern("encoding"), pmt.PMT_NIL)
+        enc = pmt.to_uint64(enc) if pmt.is_uint64(enc) else (
+            pmt.to_long(enc) if pmt.is_integer(enc) else 0)
+        if enc < 8:          # 0..7 = legacy OFDM (incl. the HT L-SIG ghost)
+            continue
         total += 1
         data = list(pmt.u8vector_elements(blob))
         if len(data) < MAC_HDR + 8:

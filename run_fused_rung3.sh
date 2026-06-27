@@ -30,9 +30,13 @@ python3 "$DEV/tools/precoder/fused_fec_tx.py" --input /tmp/fr3_src.bin --repeat 
   $FEC >/tmp/fr3_bodies.bin 2>/dev/null
 echo "[rung3] TX bodies: $(wc -c </tmp/fr3_bodies.bin) bytes  rate=$RATE"
 
-# TX (single backgrounded command — StreamTxDemo reads the body file from stdin)
+# TX (single backgrounded command — StreamTxDemo reads the body file from stdin).
+# TX_PWR (absolute TXAGC 0..63) lowers TX power so the B210, ~20 cm away, isn't
+# driven into ADC overload (received power near full-scale even at 0 dB RX gain).
+TXPWR_ENV=""
+[ -n "${TX_PWR:-}" ] && TXPWR_ENV="DEVOURER_TX_PWR_OVERRIDE=$TX_PWR"
 sudo env DEVOURER_VID=0x0bda DEVOURER_PID=0x8812 DEVOURER_CHANNEL=6 \
-     DEVOURER_TX_RATE=$RATE "$DEV/build/StreamTxDemo" < /tmp/fr3_bodies.bin \
+     DEVOURER_TX_RATE=$RATE $TXPWR_ENV "$DEV/build/StreamTxDemo" < /tmp/fr3_bodies.bin \
      >/tmp/fr3_tx.log 2>&1 &
 sleep 6
 echo "[rung3] TX status:"; grep -iE "TX ready|error|bulk-OUT" /tmp/fr3_tx.log | tail -2
