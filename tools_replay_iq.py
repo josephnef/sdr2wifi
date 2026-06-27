@@ -51,6 +51,9 @@ class replay(gr.top_block):
                                  sync_length)
 
         self.connect((self.fe, 0), (self.dm, 0))
+        # Optional soft port: per-coded-bit LLRs for decode_mac's GR_SOFT_VITERBI
+        # legacy decode (lockstep with port 0).
+        self.connect((self.fe, 1), (self.dm, 1))
         self.msg_connect((self.dm, "out"), (self.dbg, "store"))
 
     def _build_rx_chain(self, infile, idx, bw, fft_len, short, win_c, win_f, sync_length):
