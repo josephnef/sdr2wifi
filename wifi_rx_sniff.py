@@ -105,6 +105,22 @@ def scan_frames(dbg):
     return n, dev_count, first_dev
 
 
+def scan_triggers(dbg):
+    """Count 802.11ax Trigger frames among the decoded frames. A Trigger is a
+    CONTROL frame (FC byte0 = 0x24: version 0, type 1 = control, subtype 2 =
+    trigger), aired in a legacy-OFDM PPDU — so this legacy RX decodes it. Its
+    addr2/TA is the AP's MAC (not the canonical SA). Returns (count, first)."""
+    n = dbg.num_messages()
+    trig, first = 0, None
+    for i in range(n):
+        data = frame_bytes(dbg.get_message(i))
+        if data and len(data) >= 2 and data[0] == 0x24:
+            trig += 1
+            if first is None:
+                first = data
+    return trig, first
+
+
 def dump_frame(data, label):
     head = " ".join(f"{b:02x}" for b in data[:24])
     print(f"  {label}: {len(data)} bytes | first24: {head}")
@@ -153,6 +169,14 @@ def main():
           f"(SA {':'.join(f'{b:02x}' for b in CANONICAL_SA)})")
     if first_dev is not None:
         dump_frame(first_dev, "devourer frame")
+
+    # 802.11ax Trigger detection (the scheduled-UL solicitation): report any
+    # decoded control/trigger frame (FC=0x24) — the authoritative on-air proof
+    # that devourer's F2P / UL-OFDMA command made the fw transmit a Trigger.
+    trig_count, first_trig = scan_triggers(tb.dbg)
+    print(f"[wifi-rx] 802.11ax Trigger frames (FC=0x24): {trig_count}")
+    if first_trig is not None:
+        dump_frame(first_trig, "TRIGGER")
 
     if dev_count:
         print("RESULT: PASS — decoded over-air 802.11 frames from the devourer TX")
